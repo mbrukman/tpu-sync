@@ -181,66 +181,118 @@ absl::StatusOr<BlockSliceList> HostOffloadBackend::Lookup(
     return BlockSliceList{};
   }
 
-  BlockSliceList results;
-  results.reserve(block_hashes.size());
+  // Which hashes the local sweep matched -- one bit each, not the entries
+  // themselves. Neither the matched values nor pointers to them survive the
+  // registry RPC below: the RPC runs with mutex_ released, and copying a
+  // RaidenBlockID means copying the three strings inside its RaidenId, while a
+  // pointer into an LRU node dangles the moment a concurrent Delete or Evict
+  // erases that node. The assembly phase re-reads the index under the lock
+  // instead, which is both cheaper than the copies and the only way to tell
+  // that an entry is still there.
+  //
+  // The bits are still needed: they say which pins this call took, and which
+  // hashes the registry was asked about.
+  std::vector<bool> local_hit(block_hashes.size(), false);
+  std::vector<std::string> missing_hashes;
 
-  // Check Local Host LRU Cache
-  {
-    absl::MutexLock lock(mutex_);
-    for (const auto& hash : block_hashes) {
-      const RaidenBlockID* existing = options.pin_found
-                                          ? lru_cache_.GetAndPin(hash)
-                                          : lru_cache_.Peek(hash);
-      if (!existing) {
-        break;  // First miss
-      }
-      results.push_back(std::make_pair(hash, *existing));
-    }
-  }
-
-  if (results.size() == block_hashes.size() || !options.enable_global) {
-    return results;
-  }
-
-  // Check Global Registry for remaining missing hashes
   std::shared_ptr<global_registry::GlobalRegistryClient> client;
   RaidenId local_id;
+
+  // Phase 1: sweep the local index for EVERY hash, and pin each hit as it is
+  // found. Pinning up front is what makes the answer trustworthy: the registry
+  // RPC below is a blocking round trip, and without the pins another thread
+  // could evict a block between matching it here and returning it. Hits that
+  // turn out to sit past the end of the answer are unpinned again in phase 4.
   {
     absl::MutexLock lock(mutex_);
     client = registry_client_;
     local_id = raiden_id_;
+    for (size_t i = 0; i < block_hashes.size(); ++i) {
+      const auto& hash = block_hashes[i];
+      const RaidenBlockID* existing = options.pin_found
+                                          ? lru_cache_.GetAndPin(hash)
+                                          : lru_cache_.Peek(hash);
+      if (existing != nullptr) {
+        local_hit[i] = true;
+        continue;
+      }
+      if (!options.enable_interleaved_lookup) {
+        // Without interleaving the answer cannot continue past a local miss,
+        // so everything from here on is the registry's to answer.
+        missing_hashes.assign(block_hashes.begin() + i, block_hashes.end());
+        break;
+      }
+      missing_hashes.push_back(hash);
+    }
   }
 
-  if (!client) {
-    return results;  // Return partial local matches
+  // Phase 2: ask the registry about the holes only. A failure is not an error
+  // for the caller -- it just means nothing fills the holes, so the answer ends
+  // at the first one.
+  std::vector<global_registry::KVBlockMetadata> remote_hits;
+  if (!missing_hashes.empty() && options.enable_global && client != nullptr) {
+    auto global_res_or = client->Lookup(missing_hashes);
+    if (global_res_or.ok()) {
+      remote_hits = std::move(global_res_or).value();
+    } else {
+      LOG(WARNING) << "Global registry lookup failed: "
+                   << global_res_or.status().message();
+    }
   }
 
-  absl::Span<const std::string> missing_hashes =
-      block_hashes.subspan(results.size());
-  auto global_res_or = client->Lookup(
-      std::vector<std::string>(missing_hashes.begin(), missing_hashes.end()));
-  if (!global_res_or.ok()) {
-    LOG(WARNING) << "Global registry lookup failed: "
-                 << global_res_or.status().message();
-    return results;
-  }
+  // Phases 3 and 4, under one lock: walk the request in order taking each hash
+  // from whichever source has it, then hand back the pins that fell past the
+  // end of the answer.
+  BlockSliceList results;
+  results.reserve(block_hashes.size());
+  {
+    absl::MutexLock lock(mutex_);
 
-  const auto& global_results = global_res_or.value();
-  size_t num_results = std::min(global_results.size(), missing_hashes.size());
-  for (size_t i = 0; i < num_results; ++i) {
-    const auto& metadata = global_results[i];
-    const auto& proto_id = metadata.raiden_id();
-    RaidenId remote_id{
-        .job_name = proto_id.job_name(),
-        .job_replica_id = proto_id.job_replica_id(),
-        .data_name = proto_id.data_name(),
-        .data_replica_idx = proto_id.data_replica_idx(),
-    };
-    BlockStatus status =
-        (remote_id == local_id) ? BlockStatus::HOST : BlockStatus::REMOTE;
-    results.push_back(
-        std::make_pair(missing_hashes[i],
-                       RaidenBlockID(remote_id, metadata.block_id(), status)));
+    // The registry answers positionally against missing_hashes and truncates at
+    // its own first miss, so its results line up with the holes in the order
+    // they were found.
+    size_t remote_idx = 0;
+    for (size_t i = 0; i < block_hashes.size(); ++i) {
+      if (local_hit[i]) {
+        // Re-read rather than trusting the sweep: a hit that was not pinned
+        // (pin_found unset) can have been evicted while the registry RPC was in
+        // flight, and reporting a block this node no longer holds is worse than
+        // a short answer. A pinned hit is still here by construction, and this
+        // costs one index lookup either way.
+        const RaidenBlockID* existing = lru_cache_.Peek(block_hashes[i]);
+        if (existing == nullptr) {
+          break;  // Gone underneath us: the answer ends here.
+        }
+        results.emplace_back(block_hashes[i], *existing);
+        continue;
+      }
+      if (remote_idx >= remote_hits.size()) {
+        break;  // Neither source has this hash: the answer ends here.
+      }
+      const auto& metadata = remote_hits[remote_idx++];
+      const auto& proto_id = metadata.raiden_id();
+      RaidenId remote_id{
+          .job_name = proto_id.job_name(),
+          .job_replica_id = proto_id.job_replica_id(),
+          .data_name = proto_id.data_name(),
+          .data_replica_idx = proto_id.data_replica_idx(),
+      };
+      BlockStatus status =
+          (remote_id == local_id) ? BlockStatus::HOST : BlockStatus::REMOTE;
+      results.emplace_back(
+          block_hashes[i], RaidenBlockID(remote_id, metadata.block_id(), status));
+    }
+
+    // Give back the pins taken in phase 1 for hits that fell past the end of
+    // the answer. The caller never learns about those blocks, so it would never
+    // release them itself. Unpin is a no-op for a hash that is no longer there.
+    if (options.pin_found) {
+      for (size_t i = results.size(); i < block_hashes.size(); ++i) {
+        if (local_hit[i]) {
+          lru_cache_.Unpin(block_hashes[i]);
+        }
+      }
+    }
   }
 
   return results;

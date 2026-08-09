@@ -86,6 +86,15 @@ struct LookupOptions {
   // Default is true.
   bool enable_global = true;
 
+  // Controls whether a block cached remotely may sit between two blocks cached
+  // locally in the answer. When true, the local index and the global registry
+  // are consulted for every hash and the answer runs to the first hash neither
+  // can resolve. When false, the answer stops at the first LOCAL miss and only
+  // the hashes after it are looked for remotely, so a locally cached block can
+  // never follow a remote one.
+  // Default is true.
+  bool enable_interleaved_lookup = true;
+
   // Controls whether matched local blocks in store/backends are automatically
   // pinned in memory to protect against LRU eviction.
   // Default is false.

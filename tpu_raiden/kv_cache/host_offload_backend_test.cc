@@ -23,6 +23,7 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
@@ -974,6 +975,235 @@ TEST(HostOffloadBackendTest, LookupAndPinRemoteDescriptorsUnpinnedLocally) {
   EXPECT_EQ((*lookup_res)[0].first, "r1");
   EXPECT_EQ((*lookup_res)[0].second.status, BlockStatus::REMOTE);
   EXPECT_EQ(backend->GetPinCount("r1"), 0);
+}
+
+// ===========================================================================
+// Interleaved local/global lookup.
+// ===========================================================================
+
+// A backend wired to a live in-process registry, with the pieces the tests
+// below need to keep alive for the backend's lifetime.
+struct InterleavedFixture {
+  std::unique_ptr<global_registry::TestGlobalRegistryServer> registry;
+  std::unique_ptr<controller::RaidenController> controller;
+  std::shared_ptr<KVCacheStoreBackend> backend;
+  RaidenId local_id{"local_job", "0", "data", 0};
+  RaidenId peer_id{"peer_job", "0", "data", 0};
+};
+
+std::unique_ptr<InterleavedFixture> MakeInterleavedFixture(
+    size_t capacity = 100) {
+  auto fixture = std::make_unique<InterleavedFixture>();
+  fixture->registry = global_registry::CreateTestGlobalRegistryServer();
+
+  rpc::RaidenIdProto unit_proto;
+  unit_proto.set_job_name(fixture->local_id.job_name);
+  unit_proto.set_job_replica_id(fixture->local_id.job_replica_id);
+  unit_proto.set_data_name(fixture->local_id.data_name);
+  unit_proto.set_data_replica_idx(fixture->local_id.data_replica_idx);
+  fixture->controller = std::make_unique<controller::RaidenController>(
+      unit_proto, /*num_blocks=*/100, /*num_shards=*/1,
+      /*shard_size_bytes=*/1024);
+
+  BackendConfig config;
+  config.type = "HostOffloadBackend";
+  config.capacity = capacity;
+  config.global_registry_address = fixture->registry->server_address;
+  config.raiden_id = fixture->local_id;
+
+  auto backend_or =
+      HostOffloadBackend::Create(config, fixture->controller.get());
+  CHECK_OK(backend_or.status());
+  fixture->backend = *backend_or;
+  return fixture;
+}
+
+// Caches `hash` in the local index at `host_block_id`.
+void InsertLocal(KVCacheStoreBackend* backend, const RaidenId& local_id,
+                 const std::string& hash, int host_block_id) {
+  backend->Insert({hash}, {RaidenBlockID(local_id, host_block_id,
+                                         BlockStatus::HOST)},
+                  /*on_host=*/true);
+}
+
+// Publishes `hash` as owned by `owner` at `block_id`.
+void RegisterGlobal(global_registry::GlobalRegistryClient* client,
+                    const RaidenId& owner, const std::string& hash,
+                    int block_id) {
+  ASSERT_OK(client->Register({{.prefix_hash = hash,
+                               .raiden_id = owner,
+                               .block_id = block_id}}));
+}
+
+// Withdraws this node's own registration for `hash`. Insert() publishes
+// everything it caches, so a test that needs a locally cached block the
+// registry cannot answer for has to take that registration back out. The
+// registry holds one entry per owner rather than overwriting, so dropping ours
+// is also what makes a peer the sole owner of a hash we hold.
+void UnregisterLocal(global_registry::GlobalRegistryClient* client,
+                     const RaidenId& local_id, const std::string& hash) {
+  ASSERT_OK(client->Unregister({hash}, local_id));
+}
+
+TEST(HostOffloadBackendTest, LookupInterleavesLocalAndRemoteHits) {
+  auto f = MakeInterleavedFixture();
+  // [remote, local, remote, local, miss]
+  RegisterGlobal(f->registry->client.get(), f->peer_id, "r1", 42);
+  RegisterGlobal(f->registry->client.get(), f->peer_id, "r2", 43);
+  InsertLocal(f->backend.get(), f->local_id, "l1", 11);
+  InsertLocal(f->backend.get(), f->local_id, "l2", 12);
+
+  auto res = f->backend->Lookup({"r1", "l1", "r2", "l2", "nowhere"});
+  ASSERT_OK(res.status());
+  ASSERT_EQ(res->size(), 4) << "the answer must run to the first hash that "
+                               "neither source can resolve";
+
+  EXPECT_EQ((*res)[0].first, "r1");
+  EXPECT_EQ((*res)[0].second.status, BlockStatus::REMOTE);
+  EXPECT_EQ((*res)[0].second.raiden_id, f->peer_id);
+  EXPECT_EQ((*res)[0].second.host_block_id, 42);
+
+  EXPECT_EQ((*res)[1].first, "l1");
+  EXPECT_EQ((*res)[1].second.status, BlockStatus::HOST);
+  EXPECT_EQ((*res)[1].second.raiden_id, f->local_id);
+  EXPECT_EQ((*res)[1].second.host_block_id, 11);
+
+  EXPECT_EQ((*res)[2].first, "r2");
+  EXPECT_EQ((*res)[2].second.status, BlockStatus::REMOTE);
+  EXPECT_EQ((*res)[2].second.host_block_id, 43);
+
+  EXPECT_EQ((*res)[3].first, "l2");
+  EXPECT_EQ((*res)[3].second.status, BlockStatus::HOST);
+  EXPECT_EQ((*res)[3].second.host_block_id, 12);
+}
+
+TEST(HostOffloadBackendTest, LookupInterleavedResolvesLocalHitsAfterARemoteRun) {
+  auto f = MakeInterleavedFixture();
+  // The case the old two-phase logic could not express at all: the sequence
+  // opens with blocks only a peer has, and continues into blocks we hold.
+  RegisterGlobal(f->registry->client.get(), f->peer_id, "r1", 42);
+  RegisterGlobal(f->registry->client.get(), f->peer_id, "r2", 43);
+  InsertLocal(f->backend.get(), f->local_id, "l1", 11);
+  InsertLocal(f->backend.get(), f->local_id, "l2", 12);
+
+  auto res = f->backend->Lookup({"r1", "r2", "l1", "l2"});
+  ASSERT_OK(res.status());
+  ASSERT_EQ(res->size(), 4);
+  EXPECT_EQ((*res)[2].second.status, BlockStatus::HOST);
+  EXPECT_EQ((*res)[2].second.host_block_id, 11);
+  EXPECT_EQ((*res)[3].second.host_block_id, 12);
+}
+
+TEST(HostOffloadBackendTest, LookupInterleavedPrefersTheLocalIndexOverRegistry) {
+  auto f = MakeInterleavedFixture();
+  RegisterGlobal(f->registry->client.get(), f->peer_id, "r1", 42);
+  InsertLocal(f->backend.get(), f->local_id, "l1", 11);
+  // Leave a peer as the registry's only owner of a block we hold ourselves, at
+  // a different id. Consulting the registry for a hash the local index already
+  // resolved is what used to make this block look remote: the caller would read
+  // it over the network, from a block id that is not the one we hold.
+  UnregisterLocal(f->registry->client.get(), f->local_id, "l1");
+  RegisterGlobal(f->registry->client.get(), f->peer_id, "l1", 91);
+
+  auto res = f->backend->Lookup({"r1", "l1"});
+  ASSERT_OK(res.status());
+  ASSERT_EQ(res->size(), 2);
+  EXPECT_EQ((*res)[1].first, "l1");
+  EXPECT_EQ((*res)[1].second.status, BlockStatus::HOST);
+  EXPECT_EQ((*res)[1].second.raiden_id, f->local_id);
+  EXPECT_EQ((*res)[1].second.host_block_id, 11);
+}
+
+TEST(HostOffloadBackendTest, LookupInterleavedStopsAtTheFirstAbsoluteMiss) {
+  auto f = MakeInterleavedFixture();
+  InsertLocal(f->backend.get(), f->local_id, "l1", 11);
+  InsertLocal(f->backend.get(), f->local_id, "l2", 12);
+  // "gap" is in neither the local index nor the registry, so nothing after it
+  // may be reported however reachable it is.
+
+  auto res = f->backend->Lookup({"l1", "gap", "l2"});
+  ASSERT_OK(res.status());
+  ASSERT_EQ(res->size(), 1);
+  EXPECT_EQ((*res)[0].first, "l1");
+}
+
+TEST(HostOffloadBackendTest, LookupInterleavedPinsOnlyTheReturnedPrefix) {
+  auto f = MakeInterleavedFixture();
+  RegisterGlobal(f->registry->client.get(), f->peer_id, "r1", 42);
+  InsertLocal(f->backend.get(), f->local_id, "l1", 11);
+  InsertLocal(f->backend.get(), f->local_id, "l2", 12);
+
+  // "gap" ends the answer, so l2 -- a local hit that was pinned during the
+  // sweep -- has to be handed back: the caller never sees it and so would
+  // never release it.
+  auto res = f->backend->Lookup({"r1", "l1", "gap", "l2"},
+                                LookupOptions{.pin_found = true});
+  ASSERT_OK(res.status());
+  ASSERT_EQ(res->size(), 2);
+  EXPECT_EQ(f->backend->GetPinCount("l1"), 1);
+  EXPECT_EQ(f->backend->GetPinCount("l2"), 0);
+  // Registry descriptors have no local entry to pin.
+  EXPECT_EQ(f->backend->GetPinCount("r1"), 0);
+}
+
+TEST(HostOffloadBackendTest, LookupInterleavedDisabledStopsAtFirstLocalMiss) {
+  auto f = MakeInterleavedFixture();
+  RegisterGlobal(f->registry->client.get(), f->peer_id, "r1", 42);
+  InsertLocal(f->backend.get(), f->local_id, "l1", 11);
+  // Only the local index knows "l1", so the two modes give visibly different
+  // answers: without interleaving the sweep stops at "r1" and "l1" can only be
+  // looked for in the registry, which cannot answer for it.
+  UnregisterLocal(f->registry->client.get(), f->local_id, "l1");
+
+  auto legacy = f->backend->Lookup(
+      {"r1", "l1"}, LookupOptions{.enable_interleaved_lookup = false});
+  ASSERT_OK(legacy.status());
+  ASSERT_EQ(legacy->size(), 1);
+  EXPECT_EQ((*legacy)[0].first, "r1");
+
+  auto interleaved = f->backend->Lookup({"r1", "l1"});
+  ASSERT_OK(interleaved.status());
+  ASSERT_EQ(interleaved->size(), 2);
+  EXPECT_EQ((*interleaved)[1].first, "l1");
+  EXPECT_EQ((*interleaved)[1].second.status, BlockStatus::HOST);
+  EXPECT_EQ((*interleaved)[1].second.host_block_id, 11);
+}
+
+TEST(HostOffloadBackendTest, LookupInterleavedWithoutGlobalStopsAtLocalMiss) {
+  auto f = MakeInterleavedFixture();
+  RegisterGlobal(f->registry->client.get(), f->peer_id, "r1", 42);
+  InsertLocal(f->backend.get(), f->local_id, "l1", 11);
+
+  auto res = f->backend->Lookup({"r1", "l1"},
+                                LookupOptions{.enable_global = false});
+  ASSERT_OK(res.status());
+  EXPECT_TRUE(res->empty()) << "with no registry to consult, a local miss "
+                               "still ends the answer";
+
+  auto res2 = f->backend->Lookup({"l1", "r1"},
+                                 LookupOptions{.enable_global = false});
+  ASSERT_OK(res2.status());
+  ASSERT_EQ(res2->size(), 1);
+  EXPECT_EQ((*res2)[0].first, "l1");
+}
+
+TEST(HostOffloadBackendTest, LookupInterleavedWithoutRegistryClient) {
+  // No registry configured at all: holes are unfillable, so the answer is the
+  // leading run of local hits, and nothing is left pinned past it.
+  HostOffloadBackend backend(/*capacity=*/5);
+  RaidenId id{"job", "0", "data", 0};
+  backend.Insert({"l1", "l2"},
+                 {RaidenBlockID(id, 11, BlockStatus::HOST),
+                  RaidenBlockID(id, 12, BlockStatus::HOST)},
+                 /*on_host=*/true);
+
+  auto res = backend.Lookup({"l1", "gap", "l2"},
+                            LookupOptions{.pin_found = true});
+  ASSERT_OK(res.status());
+  ASSERT_EQ(res->size(), 1);
+  EXPECT_EQ((*res)[0].first, "l1");
+  EXPECT_EQ(backend.GetPinCount("l1"), 1);
+  EXPECT_EQ(backend.GetPinCount("l2"), 0);
 }
 
 }  // namespace
