@@ -88,6 +88,86 @@ TEST(TilingUtilsTest, Standard2D) {
   }
 }
 
+TEST(TilingUtilsTest, Standard2DLarge) {
+  // 2D matrix of shape 256x512, element type float (4 bytes).
+  // Total size: 256 * 512 * 4 = 512KB, which is > 128KB (triggers parallel
+  // path). Layout has minor_to_major={1, 0} (row-major), and tiling with tile
+  // dimensions 128x128.
+  const int64_t H = 256;
+  const int64_t W = 512;
+  const int64_t tH = 128;
+  const int64_t tW = 128;
+
+  xla::Shape shape = xla::ShapeUtil::MakeShapeWithDenseLayout(
+      xla::PrimitiveType::F32, {H, W}, {1, 0}, {xla::Tile({tH, tW})});
+
+  const int64_t num_elements = H * W;
+  std::vector<float> src_linear(num_elements);
+  for (int i = 0; i < num_elements; ++i) {
+    src_linear[i] = static_cast<float>(i);
+  }
+
+  const int64_t tiled_size_bytes = H * W * sizeof(float);
+  std::vector<uint8_t> dst_tiled(tiled_size_bytes);
+
+  absl::Status tile_status =
+      TileBuffer(reinterpret_cast<const uint8_t*>(src_linear.data()),
+                 dst_tiled.data(), shape, shape.layout());
+  EXPECT_TRUE(tile_status.ok()) << tile_status.ToString();
+
+  // Now detile.
+  std::vector<float> dst_linear(num_elements, 0.0f);
+  absl::Status detile_status = DetileBuffer(
+      dst_tiled.data(), reinterpret_cast<uint8_t*>(dst_linear.data()), shape,
+      shape.layout());
+  EXPECT_TRUE(detile_status.ok()) << detile_status.ToString();
+
+  for (int i = 0; i < num_elements; ++i) {
+    ASSERT_EQ(dst_linear[i], src_linear[i]) << "Mismatch at index " << i;
+  }
+}
+
+TEST(TilingUtilsTest, Padding2DLarge) {
+  // 2D matrix of shape 250x500, element type float (4 bytes).
+  // Total size: 250 * 500 * 4 = 500KB, which is > 128KB (triggers parallel
+  // path). Dimensions do not divide the tile size (128x128). Number of tiles in
+  // H: ceil(250 / 128) = 2. Number of tiles in W: ceil(500 / 128) = 4. Total
+  // tiles = 8. Total size in tiled buffer = 2 * 4 * 128 * 128 * 4 = 524288
+  // bytes (512KB).
+  const int64_t H = 250;
+  const int64_t W = 500;
+  const int64_t tH = 128;
+  const int64_t tW = 128;
+
+  xla::Shape shape = xla::ShapeUtil::MakeShapeWithDenseLayout(
+      xla::PrimitiveType::F32, {H, W}, {1, 0}, {xla::Tile({tH, tW})});
+
+  const int64_t num_elements = H * W;
+  std::vector<float> src_linear(num_elements);
+  for (int i = 0; i < num_elements; ++i) {
+    src_linear[i] = static_cast<float>(i);
+  }
+
+  const int64_t tiled_size_bytes = 2 * 4 * tH * tW * sizeof(float);
+  std::vector<uint8_t> dst_tiled(tiled_size_bytes);
+
+  absl::Status tile_status =
+      TileBuffer(reinterpret_cast<const uint8_t*>(src_linear.data()),
+                 dst_tiled.data(), shape, shape.layout());
+  EXPECT_TRUE(tile_status.ok()) << tile_status.ToString();
+
+  // Now detile back.
+  std::vector<float> dst_linear(num_elements, 0.0f);
+  absl::Status detile_status = DetileBuffer(
+      dst_tiled.data(), reinterpret_cast<uint8_t*>(dst_linear.data()), shape,
+      shape.layout());
+  EXPECT_TRUE(detile_status.ok()) << detile_status.ToString();
+
+  for (int i = 0; i < num_elements; ++i) {
+    ASSERT_EQ(dst_linear[i], src_linear[i]) << "Mismatch at index " << i;
+  }
+}
+
 TEST(TilingUtilsTest, Padding2D) {
   // 2D matrix of shape 6x6, element type float (4 bytes).
   // Layout has minor_to_major={1, 0} (row-major), and tiling with tile
