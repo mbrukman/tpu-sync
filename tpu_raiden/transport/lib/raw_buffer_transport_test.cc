@@ -27,6 +27,9 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/base/thread_annotations.h"
+#include "absl/cleanup/cleanup.h"
+#include "absl/flags/declare.h"
+#include "absl/flags/flag.h"
 #include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/strings/string_view.h"
@@ -36,6 +39,8 @@
 #include "tpu_raiden/transport/lib/conn/pool.h"
 #include "tpu_raiden/transport/lib/raw_buffer_transport_delegate.h"
 #include "tpu_raiden/transport/peregrine/src/util/util.h"
+
+ABSL_DECLARE_FLAG(size_t, raiden_transport_coalesce_window_bytes);
 
 namespace tpu_raiden::transport::lib::testing {
 namespace {
@@ -337,6 +342,141 @@ TEST(ConnPoolTest, MultiIpPoolingIsolation) {
 
   // Close the pool.
   pool.Close();
+}
+
+TEST(RawBufferTransportTest, PushBuffersCoalescedCorrectness) {
+  auto original_flag =
+      absl::GetFlag(FLAGS_raiden_transport_coalesce_window_bytes);
+  absl::SetFlag(&FLAGS_raiden_transport_coalesce_window_bytes, 4096);
+  auto cleanup = absl::MakeCleanup([=] {
+    absl::SetFlag(&FLAGS_raiden_transport_coalesce_window_bytes, original_flag);
+  });
+
+  // Set up src/dst buffers.
+  constexpr size_t size = 128 * 1024;
+  RawMockDelegate src(size);
+  RawMockDelegate dst1(size);
+  RawMockDelegate dst2(size);
+
+  // Create transports.
+  RawBufferTransport src_transport(&src, kLocalPort);
+  RawBufferTransport dst_transport1(&dst1, kLocalPort);
+  RawBufferTransport dst_transport2(&dst2, kLocalPort);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  const std::string dst1_addr = GetIpPort(dst_transport1);
+  const std::string dst2_addr = GetIpPort(dst_transport2);
+
+  // Prepare multiple payloads.
+  std::vector<uint8_t> payload1(1024);
+  std::vector<uint8_t> payload2(2048);
+  std::vector<uint8_t> payload3(4096);
+  std::vector<uint8_t> payload4(8192);
+  RandomNonZero(absl::MakeSpan(payload1));
+  RandomNonZero(absl::MakeSpan(payload2));
+  RandomNonZero(absl::MakeSpan(payload3));
+  RandomNonZero(absl::MakeSpan(payload4));
+
+  uint64_t uuid = 12345;
+  // dst1 expects 2 chunks, dst2 expects 2 chunks.
+  ASSERT_OK(dst_transport1.RegisterExpectedChunks(uuid, 2));
+  ASSERT_OK(dst_transport2.RegisterExpectedChunks(uuid, 2));
+
+  // Interleave tasks between dst1 and dst2 to test sorting.
+  std::vector<BufferPushTask> tasks = {
+      {.peer = dst1_addr,
+       .buffer_id = kBufferId,
+       .dst_shard_idx = kDstShardIdx,
+       .dst_offset_bytes = 0,
+       .data_ptr = payload1.data(),
+       .size_bytes = payload1.size()},
+      {.peer = dst2_addr,
+       .buffer_id = kBufferId,
+       .dst_shard_idx = kDstShardIdx,
+       .dst_offset_bytes = 0,
+       .data_ptr = payload2.data(),
+       .size_bytes = payload2.size()},
+      {.peer = dst1_addr,
+       .buffer_id = kBufferId,
+       .dst_shard_idx = kDstShardIdx,
+       .dst_offset_bytes = 4096,
+       .data_ptr = payload3.data(),
+       .size_bytes = payload3.size()},
+      {.peer = dst2_addr,
+       .buffer_id = kBufferId,
+       .dst_shard_idx = kDstShardIdx,
+       .dst_offset_bytes = 8192,
+       .data_ptr = payload4.data(),
+       .size_bytes = payload4.size()},
+  };
+
+  const auto push_res =
+      src_transport.PushBuffers(tasks, /*parallelism=*/2, uuid);
+  EXPECT_OK(push_res) << push_res.message();
+
+  // Post-condition: check payloads at correct offsets for dst1.
+  EXPECT_THAT(dst1.DataSpan(0, payload1.size()),
+              Pointwise(Eq(), absl::MakeConstSpan(payload1)));
+  EXPECT_THAT(dst1.DataSpan(4096, payload3.size()),
+              Pointwise(Eq(), absl::MakeConstSpan(payload3)));
+  EXPECT_TRUE(dst1.on_data_received());
+
+  // Post-condition: check payloads at correct offsets for dst2.
+  EXPECT_THAT(dst2.DataSpan(0, payload2.size()),
+              Pointwise(Eq(), absl::MakeConstSpan(payload2)));
+  EXPECT_THAT(dst2.DataSpan(8192, payload4.size()),
+              Pointwise(Eq(), absl::MakeConstSpan(payload4)));
+  EXPECT_TRUE(dst2.on_data_received());
+}
+
+TEST(RawBufferTransportTest, PushBuffersLargeBatchCorrectness) {
+  // Ensure coalescing is disabled to test the uncoalesced IOV_MAX splitting.
+  auto original_flag =
+      absl::GetFlag(FLAGS_raiden_transport_coalesce_window_bytes);
+  absl::SetFlag(&FLAGS_raiden_transport_coalesce_window_bytes, 0);
+  auto cleanup = absl::MakeCleanup([=] {
+    absl::SetFlag(&FLAGS_raiden_transport_coalesce_window_bytes, original_flag);
+  });
+
+  constexpr size_t num_tasks = 1025;  // IOV_MAX (1024) + 1
+  constexpr size_t buffer_size = num_tasks;
+
+  RawMockDelegate src(buffer_size);
+  RawMockDelegate dst(buffer_size);
+
+  RawBufferTransport src_transport(&src, kLocalPort);
+  RawBufferTransport dst_transport(&dst, kLocalPort);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  const std::string dst_addr = GetIpPort(dst_transport);
+
+  std::vector<uint8_t> payload(num_tasks);
+  RandomNonZero(absl::MakeSpan(payload));
+
+  uint64_t uuid = 99999;
+  ASSERT_OK(dst_transport.RegisterExpectedChunks(uuid, num_tasks));
+
+  std::vector<BufferPushTask> tasks;
+  tasks.reserve(num_tasks);
+  for (size_t i = 0; i < num_tasks; ++i) {
+    tasks.push_back({
+        .peer = dst_addr,
+        .buffer_id = kBufferId,
+        .dst_shard_idx = kDstShardIdx,
+        .dst_offset_bytes = i,
+        .data_ptr = &payload[i],
+        .size_bytes = 1,
+    });
+  }
+
+  const auto push_res =
+      src_transport.PushBuffers(tasks, /*parallelism=*/1, uuid);
+  EXPECT_OK(push_res) << push_res.message();
+
+  // Verify all bytes were received.
+  EXPECT_THAT(dst.DataSpan(0, num_tasks),
+              Pointwise(Eq(), absl::MakeConstSpan(payload)));
+  EXPECT_TRUE(dst.on_data_received());
 }
 
 }  // namespace

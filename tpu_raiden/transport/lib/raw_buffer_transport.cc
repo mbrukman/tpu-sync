@@ -38,6 +38,7 @@
 
 #include "absl/base/optimization.h"
 #include "absl/cleanup/cleanup.h"
+#include "absl/flags/flag.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
@@ -54,6 +55,10 @@
 #include "tpu_raiden/transport/lib/conn/pool.h"
 #include "tpu_raiden/transport/lib/raw_buffer_transport_delegate.h"
 #include "tpu_raiden/transport/peregrine/src/api/socket_util.h"
+
+ABSL_FLAG(size_t, raiden_transport_coalesce_window_bytes, 0,
+          "Maximum size in bytes of the host-side coalescing buffer used "
+          "for network transfers. Set to 0 to disable coalescing.");
 
 namespace tpu_raiden::transport::lib {
 
@@ -338,7 +343,6 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
     const uint8_t ack = 1;
     RETURN_IF_ERROR(WriteExact(client_fd, &ack, 1));
     return absl::OkStatus();
-
   } else {
     if (custom_request_handler_) {
       return custom_request_handler_(client_fd, header);
@@ -364,7 +368,9 @@ void RawBufferTransport::ConnectionWorker(int client_fd) {
     }
     if (ret == 0) continue;
 
-    if (!ProcessPeerRequest(client_fd).ok()) {
+    absl::Status status = ProcessPeerRequest(client_fd);
+    if (!status.ok()) {
+      LOG(ERROR) << "ProcessPeerRequest failed: " << status;
       break;
     }
   }
@@ -620,55 +626,94 @@ absl::Status RawBufferTransport::PushBatch(
   auto fd_cleaner =
       absl::MakeCleanup([&] { conn_pool_.Return(ok_to_pool, fd, peer); });
 
-  ChunkHeader header = {};
-  header.op = kOpBufferPushBatched;
-  header.buffer_id = 0;
-  header.remote_id = 0;
-  header.local_id = 0;
-  header.count_or_size = static_cast<uint32_t>(batch_size);
-  header.uuid = uuid;
+  const size_t max_window =
+      absl::GetFlag(FLAGS_raiden_transport_coalesce_window_bytes);
 
-  VLOG(1) << "Pushing batch to peer=" << peer << " uuid=" << uuid
-          << " batch_size=" << batch_size;
+  size_t current_task_idx = 0;
+  while (current_task_idx < batch_size) {
+    size_t sub_batch_bytes = 0;
+    size_t sub_batch_count = 0;
 
-  RETURN_IF_ERROR(WriteExact(fd, &header, sizeof(header)));
-
-  std::vector<ChunkMetadata> metadata;
-  metadata.reserve(batch_size);
-  for (size_t i = 0; i < batch_size; ++i) {
-    const auto& task = tasks[start_idx + i];
-    metadata.push_back({
-        .layer_idx = static_cast<uint32_t>(task.buffer_id),
-        .dst_shard_idx = static_cast<uint32_t>(task.dst_shard_idx),
-        .dst_offset_bytes = static_cast<uint32_t>(task.dst_offset_bytes),
-        .size_bytes = static_cast<uint32_t>(task.size_bytes),
-    });
-  }
-  RETURN_IF_ERROR(
-      WriteExact(fd, metadata.data(), sizeof(ChunkMetadata) * batch_size));
-
-  std::vector<struct iovec> iovs;
-  iovs.reserve(batch_size);
-  size_t total_bytes = 0;
-  for (size_t i = 0; i < batch_size; ++i) {
-    const auto& task = tasks[start_idx + i];
-    if (task.size_bytes > 0) {
-      struct iovec iov;
-      iov.iov_base = const_cast<uint8_t*>(task.data_ptr);
-      iov.iov_len = task.size_bytes;
-      iovs.push_back(iov);
-      total_bytes += task.size_bytes;
+    for (size_t i = current_task_idx; i < batch_size; ++i) {
+      size_t task_size = tasks[start_idx + i].size_bytes;
+      if (max_window > 0) {
+        // Coalescing path: cap by both window size and IOV_MAX
+        if ((sub_batch_bytes + task_size > max_window ||
+             sub_batch_count >= IOV_MAX) &&
+            sub_batch_count > 0) {
+          break;
+        }
+      } else {
+        // Non-coalescing path: cap only by IOV_MAX
+        if (sub_batch_count >= IOV_MAX) {
+          break;
+        }
+      }
+      sub_batch_bytes += task_size;
+      sub_batch_count++;
     }
-  }
 
-  if (total_bytes > 0) {
-    RETURN_IF_ERROR(WriteVExact(fd, iovs));
-  }
+    std::vector<ChunkMetadata> metadata;
+    metadata.reserve(sub_batch_count);
+    for (size_t i = 0; i < sub_batch_count; ++i) {
+      const auto& task = tasks[start_idx + current_task_idx + i];
+      metadata.push_back({
+          .layer_idx = static_cast<uint32_t>(task.buffer_id),
+          .dst_shard_idx = static_cast<uint32_t>(task.dst_shard_idx),
+          .dst_offset_bytes = static_cast<uint32_t>(task.dst_offset_bytes),
+          .size_bytes = static_cast<uint32_t>(task.size_bytes),
+      });
+    }
 
-  uint8_t ack = 0;
-  RETURN_IF_ERROR(ReadExact(fd, &ack, 1));
-  if (ack != 1) {
-    return absl::InternalError("PushBatch verification failed");
+    const ChunkHeader header = {
+        .op = kOpBufferPushBatched,
+        .buffer_id = 0,
+        .remote_id = 0,
+        .local_id = 0,
+        .count_or_size = static_cast<uint32_t>(sub_batch_count),
+        .uuid = uuid,
+    };
+
+    RETURN_IF_ERROR(WriteExact(fd, &header, sizeof(header)));
+    RETURN_IF_ERROR(WriteExact(fd, metadata.data(),
+                               sizeof(ChunkMetadata) * sub_batch_count));
+
+    if (max_window > 0) {
+      // Coalesced path: pack and write
+      std::vector<uint8_t> pack_buf(sub_batch_bytes);
+      size_t pack_offset = 0;
+      for (size_t i = 0; i < sub_batch_count; ++i) {
+        const auto& task = tasks[start_idx + current_task_idx + i];
+        std::memcpy(pack_buf.data() + pack_offset, task.data_ptr,
+                    task.size_bytes);
+        pack_offset += task.size_bytes;
+      }
+      RETURN_IF_ERROR(WriteExact(fd, pack_buf.data(), sub_batch_bytes));
+    } else {
+      // Uncoalesced path: gather write (writev) directly from task pointers
+      std::vector<struct iovec> iovs;
+      iovs.reserve(sub_batch_count);
+      for (size_t i = 0; i < sub_batch_count; ++i) {
+        const auto& task = tasks[start_idx + current_task_idx + i];
+        if (task.size_bytes > 0) {
+          struct iovec iov;
+          iov.iov_base = const_cast<uint8_t*>(task.data_ptr);
+          iov.iov_len = task.size_bytes;
+          iovs.push_back(iov);
+        }
+      }
+      if (!iovs.empty()) {
+        RETURN_IF_ERROR(WriteVExact(fd, iovs));
+      }
+    }
+
+    uint8_t ack = 0;
+    RETURN_IF_ERROR(ReadExact(fd, &ack, 1));
+    if (ack != 1) {
+      return absl::InternalError("PushBatch verification failed");
+    }
+
+    current_task_idx += sub_batch_count;
   }
 
   ok_to_pool = true;
