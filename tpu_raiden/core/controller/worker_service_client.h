@@ -46,6 +46,14 @@ class WorkerServiceClient {
   // (layers or blocks).
   tsl::Future<> TransferBuffers(const proto::TransferBuffersRequest& request);
 
+  // Phase-B uniform entry: submits a transfer program and resolves with the
+  // FULL response — the reshard coordinator needs success + message
+  // verbatim for its abandon-claim contract, so admission verdicts are not
+  // collapsed into a bare Status here. Transport/dispatch failures (incl.
+  // the dormant classes' UNIMPLEMENTED) surface as error statuses.
+  tsl::Future<proto::TransferProgramResponse> SubmitTransferProgram(
+      const proto::TransferProgramRequest& request);
+
  private:
   std::unique_ptr<proto::WorkerService::Stub> stub_;
 };

@@ -34,7 +34,11 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
+#include "xla/tsl/concurrency/future.h"
+#include "tpu_raiden/core/controller/raiden_controller.h"
+#include "tpu_raiden/core/transfer_program_reshard.h"
 #include "tpu_raiden/kv_cache/reshard/declaration_types.h"
+#include "tpu_raiden/proto/transfer_program.pb.h"
 
 namespace tpu_raiden {
 namespace kv_cache {
@@ -88,18 +92,14 @@ absl::Status SendWorkerRpc(FramedTransport* transport,
 
 }  // namespace
 
-std::string EncodeStartTransfer(const PoolReshardPlan& plan,
-                                const RaidenId& target) {
-  tpu_raiden::rpc::ControlRequest req;
-  req.set_command(tpu_raiden::rpc::ControlRequest::COMMAND_START_TRANSFER);
-  // peers: the destination units' data endpoints (one dst, one endpoint).
-  req.add_peers(plan.dst_peer);
+tpu_raiden::rpc::StartTransferRequest BuildStartTransferForTarget(
+    const PoolReshardPlan& plan, const RaidenId& target) {
+  tpu_raiden::rpc::StartTransferRequest start_req_storage;
 
   const bool is_sender =
       std::find(plan.src_units.begin(), plan.src_units.end(), target) !=
       plan.src_units.end();
-  tpu_raiden::rpc::StartTransferRequest* start_req =
-      req.mutable_start_transfer_request();
+  tpu_raiden::rpc::StartTransferRequest* start_req = &start_req_storage;
   for (const RaidenId& unit : plan.src_units) {
     *start_req->add_src_units() = RaidenIdToProto(unit);
   }
@@ -188,13 +188,28 @@ std::string EncodeStartTransfer(const PoolReshardPlan& plan,
     }
   }
 
+  return start_req_storage;
+}
+
+std::string EncodeStartTransfer(const PoolReshardPlan& plan,
+                                const RaidenId& target) {
+  tpu_raiden::rpc::ControlRequest req;
+  req.set_command(tpu_raiden::rpc::ControlRequest::COMMAND_START_TRANSFER);
+  // peers: the destination units' data endpoints (one dst, one endpoint).
+  req.add_peers(plan.dst_peer);
+  *req.mutable_start_transfer_request() =
+      BuildStartTransferForTarget(plan, target);
   return req.SerializeAsString();
 }
 
 ReshardCoordinator::ReshardCoordinator(WorkUnitDirectory* directory,
                                        RequestBlockRegistry* registry,
-                                       FramedTransport* transport)
-    : directory_(directory), registry_(registry), transport_(transport) {}
+                                       FramedTransport* transport,
+                                       WorkerDelivery delivery)
+    : directory_(directory),
+      registry_(registry),
+      transport_(transport),
+      delivery_(delivery) {}
 
 absl::StatusOr<std::vector<tpu_raiden::rpc::RegisterWorkUnitRequest>>
 ReshardCoordinator::QueryRemoteMetadata(const std::string& address) {
@@ -278,6 +293,11 @@ absl::Status ReshardCoordinator::ExecutePoolReshard(
         "the consumer coordinates with src_controller_address directly "
         "(the destination-side relay is retired)");
   }
+  if (delivery_.mode == WorkerDelivery::Mode::kController &&
+      delivery_.controller == nullptr) {
+    return absl::InternalError(
+        "controller-delivery reshard requires a dispatch controller");
+  }
 
   const int64_t controller_start_ns = MonotonicNs();
   const int64_t plan_build_start_ns = controller_start_ns;
@@ -335,15 +355,32 @@ absl::Status ReshardCoordinator::ExecutePoolReshard(
   // Receivers must be armed before any sender can put bytes on the wire.
   const int64_t receiver_arm_start_ns = MonotonicNs();
   {
-    auto addr_it = plan.worker_rpc_addresses.find(plan.dst_unit);
-    if (addr_it == plan.worker_rpc_addresses.end()) {
-      registry_->AbandonClaim(args.req_id, uuid, claim_owner);
-      return absl::InternalError(absl::StrCat(
-          "No control endpoint recorded for ", PythonRepr(plan.dst_unit)));
+    // Phase-A: arm the destination worker's framed listener directly.
+    // Phase-B (kController): the D9 (b) relay — the SAME payload goes to
+    // the destination STORE's reshard surface (dst_controller_address),
+    // which compiles the arm program and dispatches it through its own
+    // controller to its own worker, relaying the ack verbatim.
+    std::string arm_address;
+    if (delivery_.mode == WorkerDelivery::Mode::kController) {
+      arm_address = args.dst_controller_address;
+      if (arm_address.empty()) {
+        registry_->AbandonClaim(args.req_id, uuid, claim_owner);
+        return absl::InvalidArgumentError(
+            "controller-delivery reshard requires dst_controller_address "
+            "for the receiver-arm relay");
+      }
+    } else {
+      auto addr_it = plan.worker_rpc_addresses.find(plan.dst_unit);
+      if (addr_it == plan.worker_rpc_addresses.end()) {
+        registry_->AbandonClaim(args.req_id, uuid, claim_owner);
+        return absl::InternalError(absl::StrCat(
+            "No control endpoint recorded for ", PythonRepr(plan.dst_unit)));
+      }
+      arm_address = addr_it->second;
     }
     const std::string arm_payload = EncodeStartTransfer(plan, plan.dst_unit);
     absl::Status arm_status =
-        SendWorkerRpc(transport_, addr_it->second, arm_payload);
+        SendWorkerRpc(transport_, arm_address, arm_payload);
     if (!arm_status.ok()) {
       registry_->AbandonClaim(args.req_id, uuid, claim_owner);
       return arm_status;
@@ -355,7 +392,43 @@ absl::Status ReshardCoordinator::ExecutePoolReshard(
   // (Python gathers the same fan-out on its per-connection event loop).
   const int64_t sender_dispatch_ns = MonotonicNs();
   std::vector<absl::Status> sender_status(plan.src_units.size());
-  {
+  if (delivery_.mode == WorkerDelivery::Mode::kController) {
+    // Phase-B delivery: compile each sender's request into a transfer
+    // program and submit it through the controller submodule's persistent
+    // worker channels — replacing the connect-per-call framed fan-out.
+    std::vector<tsl::Future<tpu_raiden::proto::TransferProgramResponse>>
+        futures(plan.src_units.size());
+    for (size_t i = 0; i < plan.src_units.size(); ++i) {
+      const RaidenId& unit = plan.src_units[i];
+      auto key_it = plan.src_schedule_keys.find(unit);
+      if (key_it == plan.src_schedule_keys.end()) {
+        sender_status[i] = absl::InternalError(absl::StrCat(
+            "No schedule key recorded for ", PythonRepr(unit)));
+        continue;
+      }
+      absl::StatusOr<tpu_raiden::proto::TransferProgramRequest> program =
+          tpu_raiden::core::CompileStartTransfer(
+              BuildStartTransferForTarget(plan, unit));
+      if (!program.ok()) {
+        sender_status[i] = program.status();
+        continue;
+      }
+      futures[i] = delivery_.controller->SubmitTransferProgram(
+          absl::StrCat("worker_", key_it->second), *program);
+    }
+    for (size_t i = 0; i < plan.src_units.size(); ++i) {
+      if (!sender_status[i].ok()) continue;
+      absl::StatusOr<tpu_raiden::proto::TransferProgramResponse> response =
+          futures[i].Await();
+      if (!response.ok()) {
+        sender_status[i] = response.status();
+      } else if (!response->success()) {
+        sender_status[i] = absl::InternalError(absl::StrCat(
+            "Worker RPC to worker_", plan.src_schedule_keys.at(plan.src_units[i]),
+            " failed: ", response->message()));
+      }
+    }
+  } else {
     std::vector<std::thread> senders;
     senders.reserve(plan.src_units.size());
     for (size_t i = 0; i < plan.src_units.size(); ++i) {

@@ -21,9 +21,30 @@ load("@rules_python//python:proto.bzl", "py_proto_library")
 package(default_visibility = ["//visibility:public"])
 
 proto_library(
+    name = "transfer_program_proto",
+    srcs = ["transfer_program.proto"],
+    deps = ["//tpu_raiden/rpc:raiden_service_proto"],
+)
+
+cc_proto_library(
+    name = "transfer_program_cc_proto",
+    visibility = ["//visibility:public"],
+    deps = [":transfer_program_proto"],
+)
+
+py_proto_library(
+    name = "transfer_program_py_pb2",
+    visibility = ["//visibility:public"],
+    deps = [":transfer_program_proto"],
+)
+
+proto_library(
     name = "worker_service_proto",
     srcs = ["worker_service.proto"],
-    deps = ["//tpu_raiden/rpc:raiden_service_proto"],
+    deps = [
+        ":transfer_program_proto",
+        "//tpu_raiden/rpc:raiden_service_proto",
+    ],
 )
 
 cc_proto_library(

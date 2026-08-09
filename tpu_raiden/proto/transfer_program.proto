@@ -1,0 +1,202 @@
+// Copyright 2026 Google LLC.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package tpu_raiden.proto;
+
+import "tpu_raiden/rpc/raiden_service.proto";
+
+// ---------------------------------------------------------------------------
+// The uniform worker transfer program IR (reshard migration plan §4.6).
+//
+// One worker-facing entry for buffer movement. The schema is designed once
+// and lands whole; the phase-B implementation executes ONLY the pool-reshard
+// lowering classes (span-push sender programs and fan-in receiver-arm
+// programs). AwaitInline and Barrier contracts are dormant: the program
+// validator rejects them Unimplemented, fail-closed, until the prefix-block
+// and weight-sync paths migrate (phase C).
+//
+// Dispatch is by program shape + completion contract, never by `kind`
+// (`kind` is observability/policy only).
+// ---------------------------------------------------------------------------
+
+enum TransferKind {
+  TRANSFER_KIND_UNSPECIFIED = 0;
+  TRANSFER_KIND_PREFIX_BLOCKS = 1;
+  TRANSFER_KIND_POOL_RESHARD = 2;
+  TRANSFER_KIND_WEIGHT_SYNC = 3;
+}
+
+enum TransferRole {
+  TRANSFER_ROLE_UNSPECIFIED = 0;
+  TRANSFER_ROLE_SENDER = 1;
+  TRANSFER_ROLE_RECEIVER_ARM = 2;
+  TRANSFER_ROLE_LOCAL_COPY = 3;
+}
+
+message TransferEnvelope {
+  // Dedup + lifecycle key (RegisterActivePlan semantics). Pool-reshard
+  // programs carry StartTransferRequest.uuid two's-complement cast.
+  uint64 uuid = 1;
+  // External correlation: request / fetch / sync-round id.
+  string req_id = 2;
+  // Observability + policy ONLY, never a dispatch key.
+  TransferKind kind = 3;
+  // Validation aid: which lowering family the caller intends.
+  TransferRole role = 4;
+  // Fail-closed identity (pool layout / manifest digest). Empty for
+  // pool-reshard programs today: StartTransferRequest carries no
+  // fingerprint (identity was already checked at metadata exchange).
+  string layout_fingerprint = 5;
+  int64 deadline_ms = 6;
+}
+
+// Generalizes BufferProto-index, pool, and variable address spaces.
+message MemoryRef {
+  oneof space {
+    int32 pool_index = 1;      // registered KV pool
+    uint64 buffer_handle = 2;  // CreateBuffers host buffer
+    uint32 variable_index = 3; // manifest-resolved weight
+  }
+  tpu_raiden.rpc.MemoryType mem_type = 4;
+  // -1 = linear addressing within the space. Pool-reshard steps use
+  // block-id addressing with `space` UNSET: their pool scoping is the
+  // completion contract's group declaration (FanInGroup.pool_indices),
+  // exactly as ShardPushEntryProto.pool_group scopes entries.
+  int64 block_id = 5;
+}
+
+// == ShardPushEntryProto's span core, verbatim.
+message Extent {
+  int64 src_offset_bytes = 1;
+  int64 dst_offset_bytes = 2;
+  int64 size_bytes = 3;
+  int64 src_stride_bytes = 4;  // 0 = contiguous
+  int64 dst_stride_bytes = 5;
+  int32 count = 6;             // repeats; pool-reshard uses >=1
+}
+
+message TransferStep {
+  MemoryRef src = 1;
+  MemoryRef dst = 2;
+  repeated Extent extents = 3;
+  string dst_peer = 4;   // empty = local leg (D2H / H2D / local H2H)
+  int32 dst_shard_idx = 5;  // NUMA sub-manager routing
+  // Scopes the step to one completion group (FanIn.groups index).
+  // Presence mirrors ShardPushEntryProto.pool_group exactly: single-tag
+  // legacy plans leave it unset.
+  optional int32 group = 6;
+  // Producer-group rank owning this step. Sender programs carry the rank
+  // their schedule was keyed under; receiver-arm programs carry every
+  // rank's steps (the fan-in coverage declaration).
+  int32 source_rank = 7;
+  // Pass-through of ShardPushEntryProto.layer_idx (presence preserved).
+  optional int32 layer_idx = 8;
+}
+
+// --- Completion contracts ---------------------------------------------------
+
+// Reply after the bytes moved — one-RTT semantics (prefix-block path;
+// DORMANT in phase B).
+message AwaitInline {}
+
+// One tag class's fan-in accounting — PoolGroupProto, field-for-field.
+message FanInGroup {
+  repeated int32 pool_indices = 1;
+  repeated int64 dst_device_block_ids = 2;
+  int32 expected_pushes = 3;
+  repeated int64 dst_expected_extent_bytes = 4;
+  int32 order_rank = 5;
+}
+
+// Per-group expected pushes + extent coverage (pool-reshard path).
+message FanIn {
+  repeated FanInGroup groups = 1;
+  int64 expected_block_count = 2;
+}
+
+// Round census (weight-sync path; DORMANT in phase B).
+message Barrier {
+  int64 round_id = 1;
+  int64 expected_census = 2;
+}
+
+message CompletionContract {
+  oneof mode {
+    AwaitInline await = 1;
+    FanIn fan_in = 2;
+    Barrier barrier = 3;
+  }
+}
+
+message ExecutionPolicy {
+  int32 parallelism = 1;
+  // Presence-preserving mirror of StartTransferRequest.skip_d2h.
+  optional bool skip_d2h = 2;
+  // Keyed by layer index; absent-when-empty like the source field.
+  map<int32, bool> skip_tiling = 3;
+  tpu_raiden.rpc.MemoryType dst_mem_type = 4;
+  bool use_block_chunks = 5;
+}
+
+// Pool-space binding data for TRANSFER_KIND_POOL_RESHARD programs: names the
+// units and canonical pools the steps' block addressing resolves against.
+// Typed here (not smeared over MemoryRef) so the reshard class round-trips
+// losslessly; other kinds leave it unset and the validator enforces that.
+message ReshardBinding {
+  repeated tpu_raiden.rpc.RaidenIdProto src_units = 1;
+  repeated tpu_raiden.rpc.RaidenIdProto dst_units = 2;
+  repeated int32 transfer_pool_indices = 3;
+  repeated string pool_dtype_tags = 4;
+}
+
+message TransferProgram {
+  repeated TransferStep steps = 1;
+  CompletionContract completion = 2;
+  ExecutionPolicy policy = 3;
+  ReshardBinding reshard = 4;
+}
+
+message TransferProgramRequest {
+  TransferEnvelope envelope = 1;
+  TransferProgram program = 2;
+}
+
+// In-band failure semantics identical to the framed door's ControlResponse:
+// gRPC status stays OK for admission verdicts; success=false + message carry
+// contract-bearing error strings verbatim.
+message TransferProgramResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message PollTransferRequest {
+  uint64 uuid = 1;
+}
+
+message PollTransferResponse {
+  bool found = 1;
+  bool complete = 2;
+  string message = 3;
+}
+
+message AbortTransferRequest {
+  uint64 uuid = 1;
+}
+
+message AbortTransferResponse {
+  bool success = 1;
+  string message = 2;
+}

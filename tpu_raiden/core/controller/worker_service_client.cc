@@ -72,6 +72,28 @@ tsl::Future<proto::DeleteBuffersResponse> WorkerServiceClient::DeleteBuffers(
   return future;
 }
 
+tsl::Future<proto::TransferProgramResponse>
+WorkerServiceClient::SubmitTransferProgram(
+    const proto::TransferProgramRequest& request) {
+  auto [promise, future] =
+      tsl::MakePromise<proto::TransferProgramResponse>();
+  auto context = std::make_shared<grpc::ClientContext>();
+  auto response = std::make_shared<proto::TransferProgramResponse>();
+
+  stub_->async()->SubmitTransferProgram(
+      context.get(), &request, response.get(),
+      [context, response,
+       promise = std::move(promise).ToShared()](grpc::Status status) {
+        if (!status.ok()) {
+          promise->Set(absl::InternalError(absl::StrCat(
+              "SubmitTransferProgram RPC failed: ", status.error_message())));
+        } else {
+          promise->Set(std::move(*response));
+        }
+      });
+  return future;
+}
+
 tsl::Future<> WorkerServiceClient::TransferBuffers(
     const proto::TransferBuffersRequest& request) {
   auto [promise, future] = tsl::MakePromise<>();

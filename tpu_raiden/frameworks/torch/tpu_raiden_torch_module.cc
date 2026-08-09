@@ -46,6 +46,19 @@ namespace nb = nanobind;
 using ::tpu_raiden::torch::KVCacheManager;
 using ::tpu_raiden::torch::WeightSynchronizer;
 
+namespace {
+
+// Phase-B engine-hosted reshard store (zero sidecar processes): owns the
+// framed reshard service in controller-delivery mode plus the dispatch
+// controller local workers register with. Held alive by the hosting
+// (transfer-rank-0) worker for the process lifetime.
+struct ReshardStoreHandle {
+  std::unique_ptr<tpu_raiden::kv_cache::KVCacheStore> store;
+  int reshard_port = 0;
+};
+
+}  // namespace
+
 namespace tpu_raiden {
 namespace kv_cache {
 namespace {
@@ -501,6 +514,37 @@ NB_MODULE(_tpu_raiden_torch, m) {
       .def_rw("device_block_id",
               &tpu_raiden::kv_cache::RaidenBlockID::device_block_id)
       .def_rw("status", &tpu_raiden::kv_cache::RaidenBlockID::status);
+
+  nb::class_<ReshardStoreHandle>(m, "ReshardStore")
+      .def(
+          "__init__",
+          [](ReshardStoreHandle* self, int reshard_port,
+             const std::string& dispatch_bind_address,
+             double request_registry_ttl_s,
+             const tpu_raiden::kv_cache::RaidenId& unit) {
+            new (self) ReshardStoreHandle();
+            absl::StatusOr<
+                std::unique_ptr<tpu_raiden::kv_cache::KVCacheStore>>
+                store =
+                    tpu_raiden::kv_cache::KVCacheStore::CreateReshardStore(
+                        reshard_port, request_registry_ttl_s, unit,
+                        dispatch_bind_address);
+            if (!store.ok()) {
+              throw std::runtime_error(absl::StrCat(
+                  "CreateReshardStore failed: ", store.status().message()));
+            }
+            self->store = std::move(*store);
+            self->reshard_port = self->store->reshard_service()->port();
+          },
+          nb::arg("reshard_port"), nb::arg("dispatch_bind_address"),
+          nb::arg("request_registry_ttl_s") = 600.0,
+          nb::arg("unit") = tpu_raiden::kv_cache::RaidenId(),
+          // Binds two listening surfaces and starts C++ service threads;
+          // release the GIL like the KVCacheStore constructor below.
+          nb::call_guard<nb::gil_scoped_release>())
+      .def_prop_ro("reshard_port", [](ReshardStoreHandle& self) {
+        return self.reshard_port;
+      });
 
   nb::class_<tpu_raiden::kv_cache::KVCacheStoreWrapper>(m, "KVCacheStore")
       .def(nb::init<size_t, std::string, tpu_raiden::kv_cache::RaidenId, int,

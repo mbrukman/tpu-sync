@@ -162,6 +162,16 @@ class KVCacheStore {
   // RaidenController submodule. It is the phase-A sidecar substitution for
   // the Python controller process; every full-store construction path above
   // is untouched (their validation still requires backends + num_shards>=1).
+  // W2 (phase B): the engine-hosted reshard store — a thin store owning
+  // BOTH the reshard service (controller-delivery mode, D9 (b)) and the
+  // dispatch RaidenController its local workers register with. Zero sidecar
+  // processes: vLLM's transfer-rank-0 worker constructs this in-process.
+  // `dispatch_bind_address` is the host:port the RegisterWorker surface
+  // binds and advertises; the framed reshard surface binds `reshard_port`.
+  static absl::StatusOr<std::unique_ptr<KVCacheStore>> CreateReshardStore(
+      int reshard_port, double request_registry_ttl_s, const RaidenId& unit,
+      absl::string_view dispatch_bind_address);
+
   static absl::StatusOr<std::unique_ptr<KVCacheStore>> CreateReshardSidecar(
       int reshard_port, double request_registry_ttl_s);
 

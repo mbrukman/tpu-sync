@@ -32,15 +32,37 @@
 #include "tpu_raiden/rpc/raiden_service.pb.h"
 
 namespace tpu_raiden {
+namespace controller {
+class RaidenController;
+}  // namespace controller
+
 namespace kv_cache {
 namespace reshard {
 
+// The per-target StartTransferRequest (sender gets its own schedule under
+// key 0; the receiver gets every source's schedule keyed by source
+// ordinal). Split out of EncodeStartTransfer so the phase-B controller
+// delivery compiles the SAME proto object the framed wire would carry.
+tpu_raiden::rpc::StartTransferRequest BuildStartTransferForTarget(
+    const PoolReshardPlan& plan, const RaidenId& target);
+
 // Wire encoder: the pool-path port of WorkerRpcClient._encode_start_transfer.
-// Builds the framed ControlRequest payload for one target unit (sender gets
-// its own schedule under key 0; the receiver gets every source's schedule
-// keyed by source ordinal).
+// Builds the framed ControlRequest payload for one target unit.
 std::string EncodeStartTransfer(const PoolReshardPlan& plan,
                                 const RaidenId& target);
+
+// Phase-B worker-delivery selection (plan D9). kFramed is the phase-A wire
+// (store speaks framed TCP to every worker). kController routes sender
+// programs through the local RaidenController submodule's persistent
+// WorkerService channels and receiver arming through the destination
+// STORE's framed surface (the D9 (b) relay: the destination dispatches to
+// its own workers via its own controller).
+struct WorkerDelivery {
+  enum class Mode { kFramed, kController };
+  Mode mode = Mode::kFramed;
+  // Borrowed; required (non-null) when mode == kController.
+  tpu_raiden::controller::RaidenController* controller = nullptr;
+};
 
 // Decoded CoordinateTransferRequest arguments for the pool path.
 struct PoolReshardArgs {
@@ -71,7 +93,8 @@ class ReshardCoordinator {
  public:
   ReshardCoordinator(WorkUnitDirectory* directory,
                      RequestBlockRegistry* registry,
-                     FramedTransport* transport);
+                     FramedTransport* transport,
+                     WorkerDelivery delivery = WorkerDelivery{});
 
   // GetTransferStatusResponse::Status values.
   enum class Status : int {
@@ -96,6 +119,7 @@ class ReshardCoordinator {
   WorkUnitDirectory* directory_;
   RequestBlockRegistry* registry_;
   FramedTransport* transport_;
+  WorkerDelivery delivery_;
 
   mutable absl::Mutex status_mu_;
   std::map<std::string, Status> transfer_status_

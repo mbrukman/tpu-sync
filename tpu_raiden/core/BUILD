@@ -277,9 +277,43 @@ cc_library(
         ":raiden_transfer_endpoint",
         ":raw_transfer_core",
         ":status_macros",
+        "//tpu_raiden/rpc:raiden_service_cc_proto",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+cc_test(
+    name = "transfer_program_reshard_test",
+    srcs = ["transfer_program_reshard_test.cc"],
+    copts = ["-fexceptions"],
+    features = ["-use_header_modules"],
+    linkstatic = True,
+    deps = [
+        ":transfer_program_reshard",
+        "//tpu_raiden/proto:transfer_program_cc_proto",
+        "//tpu_raiden/rpc:raiden_service_cc_proto",
+        "@com_google_absl//absl/status",
+        "@com_google_googletest//:gtest_main",
+        "@com_google_protobuf//:protobuf",
+    ],
+)
+
+cc_library(
+    name = "transfer_program_reshard",
+    srcs = ["transfer_program_reshard.cc"],
+    hdrs = ["transfer_program_reshard.h"],
+    features = ["-use_header_modules"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//tpu_raiden/proto:transfer_program_cc_proto",
+        "//tpu_raiden/rpc:raiden_service_cc_proto",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
     ],
 )
 

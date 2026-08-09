@@ -33,7 +33,10 @@
 #include "tpu_raiden/core/kv_manager_holder.h"
 #include "tpu_raiden/core/raiden_transfer_endpoint.h"
 #include "tpu_raiden/core/raw_transfer_core.h"
+#include "tpu_raiden/core/transfer_program_reshard.h"
+#include "tpu_raiden/proto/transfer_program.pb.h"
 #include "tpu_raiden/proto/worker_service.pb.h"
+#include "tpu_raiden/rpc/raiden_service.pb.h"
 
 namespace tpu_raiden {
 namespace controller {
@@ -345,6 +348,73 @@ absl::StatusOr<HostBufferAllocation> WorkerServiceImpl::GetBuffer(
 size_t WorkerServiceImpl::GetBufferCount() const {
   absl::MutexLock lock(mutex_);
   return buffers_.size();
+}
+
+grpc::Status WorkerServiceImpl::SubmitTransferProgram(
+    grpc::ServerContext* context, const proto::TransferProgramRequest* request,
+    proto::TransferProgramResponse* response) {
+  // Class rejection is a dispatch failure, not an admission verdict: the
+  // dormant contract classes and malformed programs fail loudly at the gRPC
+  // layer so nothing mistakes them for an executed-and-failed transfer.
+  absl::StatusOr<core::ReshardLoweringClass> lowering_class =
+      core::NormalizeReshardProgram(*request);
+  if (!lowering_class.ok()) {
+    grpc::StatusCode code =
+        lowering_class.status().code() == absl::StatusCode::kUnimplemented
+            ? grpc::StatusCode::UNIMPLEMENTED
+            : grpc::StatusCode::INVALID_ARGUMENT;
+    return grpc::Status(code,
+                        std::string(lowering_class.status().message()));
+  }
+
+  absl::StatusOr<rpc::StartTransferRequest> lowered =
+      core::LowerToStartTransfer(*request);
+  if (!lowered.ok()) {
+    return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                        std::string(lowered.status().message()));
+  }
+
+  // From here down the semantics are the framed door's: run the same pool
+  // executor op the listener would, and carry its verdict in-band.
+  absl::MutexLock lock(mutex_);
+  if (transfer_manager_ == nullptr) {
+    response->set_success(false);
+    response->set_message("Transfer manager is not initialized");
+    return grpc::Status::OK;
+  }
+
+  absl::Status status;
+  if (*lowering_class == core::ReshardLoweringClass::kPoolReshardSender) {
+    const std::vector<int64_t> src_block_ids =
+        core::DeriveSenderSourceBlockIds(*lowered);
+    status = transfer_manager_.PoolReshardPush(*lowered, src_block_ids,
+                                               lowered->parallelism());
+  } else {
+    const std::vector<int64_t> chip_block_ids =
+        core::DeriveArmChipBlockIds(*lowered);
+    status = transfer_manager_.PoolReshardRegisterRecv(*lowered,
+                                                       chip_block_ids);
+  }
+
+  response->set_success(status.ok());
+  response->set_message(status.ok() ? "SUCCESS"
+                                    : std::string(status.message()));
+  return grpc::Status::OK;
+}
+
+grpc::Status WorkerServiceImpl::PollTransfer(
+    grpc::ServerContext* context, const proto::PollTransferRequest* request,
+    proto::PollTransferResponse* response) {
+  return grpc::Status(grpc::StatusCode::UNIMPLEMENTED,
+                      "PollTransfer is not implemented in phase B; transfer "
+                      "completion rides the existing connector polling");
+}
+
+grpc::Status WorkerServiceImpl::AbortTransfer(
+    grpc::ServerContext* context, const proto::AbortTransferRequest* request,
+    proto::AbortTransferResponse* response) {
+  return grpc::Status(grpc::StatusCode::UNIMPLEMENTED,
+                      "AbortTransfer is not implemented in phase B");
 }
 
 }  // namespace controller

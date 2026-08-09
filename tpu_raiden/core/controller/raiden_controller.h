@@ -221,6 +221,15 @@ class RaidenController {
   absl::StatusOr<std::string> ResolvePeerController(
       const rpc::RaidenIdProto& peer_id);
 
+  // D9-B pure-carrier dispatch (phase B of the reshard migration): forwards
+  // an opaque transfer program to the named registered worker over its
+  // persistent WorkerService channel. The controller performs no plan
+  // interpretation and holds no reshard state (D8); an unknown worker id or
+  // missing client resolves the future with an error status.
+  tsl::Future<proto::TransferProgramResponse> SubmitTransferProgram(
+      absl::string_view worker_id,
+      const proto::TransferProgramRequest& request);
+
   // Accessors for state inspection and testing.
   const rpc::RaidenIdProto& unit() const { return unit_; }
   kv_cache::LogicalBlockManager* block_manager() const {

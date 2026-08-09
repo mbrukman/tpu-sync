@@ -49,12 +49,18 @@
 #include "google/protobuf/io/coded_stream.h"
 #include "google/protobuf/io/zero_copy_stream_impl_lite.h"
 #include "google/protobuf/util/message_differencer.h"
+#include "tpu_raiden/core/transfer_program_reshard.h"
 #include "tpu_raiden/kv_cache/reshard/framed_rpc.h"
 #include "tpu_raiden/kv_cache/reshard/reshard_service.h"
+#include "tpu_raiden/proto/transfer_program.pb.h"
 #include "tpu_raiden/rpc/controller_service.pb.h"
 #include "tpu_raiden/rpc/raiden_service.pb.h"
 
 ABSL_FLAG(std::string, log, "", "Recorded controller jsonl to replay.");
+ABSL_FLAG(bool, program_roundtrip, false,
+          "Gate GB1: instead of replaying, compile every recorded pool "
+          "worker payload to a TransferProgram, lower it back, and demand "
+          "byte-identity plus derivation parity.");
 ABSL_FLAG(std::string, peer_metadata_log, "",
           "Peer controller jsonl whose remote_metadata_in records check "
           "this side's GET_METADATA responses.");
@@ -209,6 +215,80 @@ void ReportByteDiff(const std::string& expected, const std::string& actual) {
   }
 }
 
+// Gate GB1 (phase B): compile the recorded worker payload's
+// StartTransferRequest into a TransferProgram, normalize it, lower it back,
+// and demand byte-identity under deterministic serialization plus
+// listener-parity block-id derivations. Returns false (and reports) on any
+// divergence.
+bool ProgramRoundtripChecks(const std::string& payload, int* checked) {
+  rpcpb::ControlRequest req;
+  if (!req.ParseFromString(payload) || !req.has_start_transfer_request()) {
+    return true;  // not a plan payload (metadata/shutdown already skipped)
+  }
+  const auto& original = req.start_transfer_request();
+  if (original.transfer_pool_indices().empty() &&
+      original.pool_groups().empty()) {
+    return true;  // legacy dense plan: stays on the framed door
+  }
+  ++*checked;
+  auto program = tpu_raiden::core::CompileStartTransfer(original);
+  if (!program.ok()) {
+    std::fprintf(stderr, "GB1 FAIL compile: %s\n",
+                 std::string(program.status().message()).c_str());
+    return false;
+  }
+  auto lowering_class = tpu_raiden::core::NormalizeReshardProgram(*program);
+  if (!lowering_class.ok()) {
+    std::fprintf(stderr, "GB1 FAIL normalize: %s\n",
+                 std::string(lowering_class.status().message()).c_str());
+    return false;
+  }
+  const bool expect_sender = original.is_sender();
+  const bool is_sender_class =
+      *lowering_class ==
+      tpu_raiden::core::ReshardLoweringClass::kPoolReshardSender;
+  if (expect_sender != is_sender_class) {
+    std::fprintf(stderr, "GB1 FAIL: lowering class role mismatch\n");
+    return false;
+  }
+  auto lowered = tpu_raiden::core::LowerToStartTransfer(*program);
+  if (!lowered.ok()) {
+    std::fprintf(stderr, "GB1 FAIL lower: %s\n",
+                 std::string(lowered.status().message()).c_str());
+    return false;
+  }
+  auto canon = [](const rpcpb::StartTransferRequest& msg)
+      -> absl::StatusOr<std::string> {
+    std::string out;
+    google::protobuf::io::StringOutputStream stream(&out);
+    google::protobuf::io::CodedOutputStream coded(&stream);
+    coded.SetSerializationDeterministic(true);
+    if (!msg.SerializeToCodedStream(&coded)) {
+      return absl::InternalError("serialization failed");
+    }
+    coded.Trim();
+    return out;
+  };
+  auto expected = canon(original);
+  auto actual = canon(*lowered);
+  if (!expected.ok() || !actual.ok() || *expected != *actual) {
+    std::fprintf(stderr, "GB1 FAIL: lowered StartTransferRequest is not "
+                         "byte-identical to the original\n");
+    if (expected.ok() && actual.ok()) {
+      ReportByteDiff(*expected, *actual);
+    }
+    return false;
+  }
+  if (tpu_raiden::core::DeriveSenderSourceBlockIds(original) !=
+          tpu_raiden::core::DeriveSenderSourceBlockIds(*lowered) ||
+      tpu_raiden::core::DeriveArmChipBlockIds(original) !=
+          tpu_raiden::core::DeriveArmChipBlockIds(*lowered)) {
+    std::fprintf(stderr, "GB1 FAIL: block-id derivations diverge\n");
+    return false;
+  }
+  return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -242,6 +322,23 @@ int main(int argc, char** argv) {
       }
       recorded_out[record.addr].push_back(record.payload);
     }
+  }
+
+  if (absl::GetFlag(FLAGS_program_roundtrip)) {
+    int checked = 0;
+    int roundtrip_failures = 0;
+    for (const auto& [addr, payloads] : recorded_out) {
+      for (const std::string& payload : payloads) {
+        if (!ProgramRoundtripChecks(payload, &checked)) {
+          ++roundtrip_failures;
+        }
+      }
+    }
+    std::fprintf(stderr,
+                 "GB1 program-roundtrip: %d checked, %d failures "
+                 "(skipped shutdown/metadata: %d)\n",
+                 checked, roundtrip_failures, skipped_shutdown);
+    return (roundtrip_failures == 0 && checked > 0) ? 0 : 1;
   }
 
   ReplayTransport transport(std::move(metadata_fifo));

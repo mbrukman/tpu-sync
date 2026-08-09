@@ -23,8 +23,12 @@
 
 #include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "tpu_raiden/core/controller/raiden_controller.h"
+#include "tpu_raiden/core/transfer_program_reshard.h"
 #include "tpu_raiden/kv_cache/reshard/declaration_types.h"
+#include "tpu_raiden/proto/transfer_program.pb.h"
 #include "tpu_raiden/rpc/controller_service.pb.h"
 #include "tpu_raiden/rpc/raiden_service.pb.h"
 
@@ -50,7 +54,7 @@ std::string StatusMessage(const absl::Status& status) {
 }  // namespace
 
 ReshardService::ReshardService(const Options& options)
-    : requested_port_(options.port) {
+    : requested_port_(options.port), delivery_(options.delivery) {
   FramedTransport* transport = options.transport;
   if (transport == nullptr) {
     default_transport_ = std::make_unique<SocketFramedTransport>();
@@ -63,7 +67,7 @@ ReshardService::ReshardService(const Options& options)
   registry_ = std::make_unique<RequestBlockRegistry>(
       directory_.get(), options.request_registry_ttl_s, std::move(clock));
   coordinator_ = std::make_unique<ReshardCoordinator>(
-      directory_.get(), registry_.get(), transport);
+      directory_.get(), registry_.get(), transport, delivery_);
 }
 
 ReshardService::~ReshardService() { StopServer(); }
@@ -363,6 +367,65 @@ std::string ReshardService::HandleRaidenCommand(
             "reshard controller; keep the Python sidecar for "
             "dense/weight-sync paths");
       }
+      break;
+    }
+    case rpcpb::ControlRequest::COMMAND_START_TRANSFER: {
+      // Phase-B D9 (b) receiver-arm relay: the source store sends the arm
+      // StartTransferRequest — byte-identical to the phase-A worker arm —
+      // to THIS destination store, which dispatches it to its own local
+      // worker through its own controller and relays the ack verbatim.
+      if (delivery_.mode != WorkerDelivery::Mode::kController ||
+          delivery_.controller == nullptr) {
+        raiden_resp.set_message(
+            "START_TRANSFER is not served on this surface: the phase-A "
+            "reshard service arms workers directly");
+        break;
+      }
+      if (!raiden_req.has_start_transfer_request()) {
+        raiden_resp.set_message("Missing start_transfer_request");
+        break;
+      }
+      const auto& start_req = raiden_req.start_transfer_request();
+      if (start_req.is_sender() ||
+          (start_req.transfer_pool_indices().empty() &&
+           start_req.pool_groups().empty())) {
+        raiden_resp.set_message(
+            "arm relay accepts only pool receiver-arm requests");
+        break;
+      }
+      if (start_req.dst_units_size() != 1) {
+        raiden_resp.set_message(absl::StrCat(
+            "arm relay expects exactly one destination unit, got ",
+            start_req.dst_units_size()));
+        break;
+      }
+      const RaidenId dst_unit = RaidenIdFromProto(start_req.dst_units(0));
+      auto metadata = directory_->LocalMetadata({dst_unit});
+      if (!metadata.ok()) {
+        raiden_resp.set_message(absl::StrCat(
+            "arm relay: destination unit is not registered here: ",
+            metadata.status().message()));
+        break;
+      }
+      const int32_t transfer_rank = (*metadata)[0].transfer_rank();
+      auto program = tpu_raiden::core::CompileStartTransfer(start_req);
+      if (!program.ok()) {
+        raiden_resp.set_message(
+            std::string(program.status().message()));
+        break;
+      }
+      absl::StatusOr<tpu_raiden::proto::TransferProgramResponse> response =
+          delivery_.controller
+              ->SubmitTransferProgram(
+                  absl::StrCat("worker_", transfer_rank), *program)
+              .Await();
+      if (!response.ok()) {
+        raiden_resp.set_message(
+            std::string(response.status().message()));
+        break;
+      }
+      raiden_resp.set_success(response->success());
+      raiden_resp.set_message(response->message());
       break;
     }
     case rpcpb::ControlRequest::COMMAND_SHUTDOWN: {

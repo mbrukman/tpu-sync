@@ -45,6 +45,12 @@ class ReshardService {
     // Injectable for replay/tests; defaults to the socket transport.
     FramedTransport* transport = nullptr;
     RequestBlockRegistry::Clock clock;  // defaults to steady_clock seconds
+    // Phase-B worker delivery (plan D9). kController additionally enables
+    // the receiver-arm relay on this service's framed surface: an inbound
+    // pool START_TRANSFER (receiver) is compiled to a transfer program and
+    // dispatched through delivery.controller to the locally-registered
+    // destination worker.
+    WorkerDelivery delivery;
   };
 
   explicit ReshardService(const Options& options);
@@ -87,6 +93,7 @@ class ReshardService {
   std::unique_ptr<FramedServer> server_;
   std::function<void()> shutdown_callback_;
   int requested_port_ = 0;
+  WorkerDelivery delivery_;
 };
 
 }  // namespace reshard
